@@ -11,7 +11,7 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 
 from config import config
 
-# Needed for torch.load(model.pt)
+# Import model classes referenced by serialized checkpoints.
 from DTE_model.DTE_network import (
     Encoder, Decoder, TSHAE, DropBlockLatent, WaveletConvBlock, FourierBlock
 )
@@ -24,10 +24,19 @@ from RUL_models.TransformerBased_RUL import TransformerRULPredictor
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+VALID_FDS = ("FD001", "FD002", "FD003", "FD004")
 
 # 17-sensor indices inside the 25-d preprocessed vector
 # 0=time, 1..3=settings, 4=T2, 5=T24, 6=T30, 7=T50, ...
 SENSOR_IDXS_17 = np.array([1, 2, 3, 5, 6, 7, 10, 11, 12, 14, 15, 16, 17, 18, 20, 23, 24], dtype=np.int64)
+
+
+def normalize_fds(fds):
+    normalized = [fd.upper() for fd in fds]
+    invalid = [fd for fd in normalized if fd not in VALID_FDS]
+    if invalid:
+        raise ValueError(f"Unsupported FD subset(s): {', '.join(invalid)}")
+    return normalized
 
 
 def set_seed(seed: int):
@@ -58,10 +67,10 @@ def calculate_metrics(predictions, targets):
     return rmse, r2, float(score)
 
 
-def paths_for_fd(fd: str, split: str):
+def paths_for_fd(fd: str, split: str, step: int = 1):
     prep_dir = os.path.join(config["output_dir"], "preprocessed")
     ws = int(config["window_size"])
-    prefix = f"{fd}_{split}_ws{ws}_step1"
+    prefix = f"{fd}_{split}_ws{ws}_step{step}"
 
     data_path  = os.path.join(prep_dir, f"preprocessed_data_{prefix}.npy")
     ruls_path  = os.path.join(prep_dir, f"preprocessed_ruls_{prefix}.npy")
@@ -92,7 +101,7 @@ class MemMapWindowRULDataset(Dataset):
 
     This is intentionally NOT PreprocessedDatasetDTE:
     - DTE dataset is for DTE training and generally loads into RAM.
-    - Here we need scalable IO and real+gen concatenation (large), so memmap is better.
+    - RUL training concatenates real and generated windows, so memmap keeps IO scalable.
     """
     def __init__(
         self,
@@ -155,14 +164,14 @@ def load_models(fd: str):
 
 
 @torch.no_grad()
-def build_or_load_generated_train(fd: str, batch_size: int, seed: int, clip_gen: bool = False):
+def build_or_load_generated_train(fd: str, batch_size: int, seed: int, clip_gen: bool = False, step: int = 1):
     """
-    Builds FULL generated train windows aligned 1-to-1 with ALL real train windows.
+    Build generated train windows aligned one-to-one with real train windows.
     Cache location:
       output/augmented/preprocessed_data_{prefix}_GEN.npy
       output/augmented/preprocessed_ruls_{prefix}_GEN.npy
     """
-    x_tr, y_tr, _, a_tr, prefix = paths_for_fd(fd, "train")
+    x_tr, y_tr, _, a_tr, prefix = paths_for_fd(fd, "train", step=step)
 
     out_aug = os.path.join(config["output_dir"], "augmented")
     os.makedirs(out_aug, exist_ok=True)
@@ -182,7 +191,7 @@ def build_or_load_generated_train(fd: str, batch_size: int, seed: int, clip_gen:
 
     dte, diff, diffusion = load_models(fd)
 
-    # write using memmap to avoid huge RAM spikes
+    # Write with memmap to avoid large RAM spikes.
     xg_mm = np.lib.format.open_memmap(xg_path, mode="w+", dtype=np.float32, shape=(N, L, F))
     np.save(yg_path, y)  # labels identical to real windows
 
@@ -206,17 +215,17 @@ def build_or_load_generated_train(fd: str, batch_size: int, seed: int, clip_gen:
             print(f"[GEN BUILD] {fd}: {e}/{N} windows generated")
 
     del xg_mm
-    print(f"[GEN BUILD] Saved FULL generated train set:\n  {xg_path}\n  {yg_path}")
+    print(f"[GEN BUILD] Saved generated train set:\n  {xg_path}\n  {yg_path}")
     return xg_path, yg_path
 
 
 def forward_model(model, batch_x):
     """
     Unified contract:
-      batch_x is ALWAYS [B, L, 17]
-    And your models should accept [B, L, 17] directly.
+      batch_x is always [B, L, 17]
+    RUL models should accept [B, L, 17] directly.
 
-    This function keeps a couple of safe fallbacks for legacy variants,
+    This function keeps safe fallbacks for legacy variants,
     but the default path is: model(batch_x).
     """
     try:
@@ -228,7 +237,7 @@ def forward_model(model, batch_x):
         if ("input.dim() = 4" in msg) or ("permute" in msg and batch_x.dim() == 3):
             return model(batch_x.unsqueeze(1)).view(-1)
 
-        # Some legacy conv1d hybrids might expect [B, 17, L] (channels-first) and do NOT permute internally
+        # Some legacy conv1d hybrids expect [B, 17, L] and do not permute internally.
         if ("expected input" in msg and "to have 14 channels" in msg) or ("Given groups" in msg and "channels" in msg):
             x_cf = batch_x.permute(0, 2, 1).contiguous()  # [B,17,L]
             return model(x_cf).view(-1)
@@ -301,7 +310,7 @@ def train_one_model(model, model_name, train_loader, test_loader, out_dir,
             "Best RMSE": f"{min_rms:.4f}",
             "Best R2": f"{best_r2:.4f}",
             f"Score": f"{score:.4f}",
-            "🥲": retain
+            "no_improve": retain
         })
 
         if rmse < best_rmse:
@@ -325,40 +334,52 @@ def build_models():
     return models
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--fd", type=str, default="FD001")
-    ap.add_argument("--eval_mode", type=str, default="engine", choices=["window", "engine"])
+def build_arg_parser():
+    ap = argparse.ArgumentParser(description="Train RUL predictors on real plus generated CMAPSS windows.")
+    ap.add_argument("--fd", type=str, default=None, help="Single FD subset. Kept for backward compatibility.")
+    ap.add_argument("--fds", nargs="+", default=None, help="One or more FD subsets to train.")
+    ap.add_argument("--output_dir", "--output-dir", dest="output_dir", default=config["output_dir"])
+    ap.add_argument("--window_size", "--window-size", dest="window_size", type=int, default=int(config["window_size"]))
+    ap.add_argument("--step", type=int, default=1)
+    ap.add_argument("--eval_mode", "--eval-mode", dest="eval_mode", type=str, default="engine", choices=["window", "engine"])
     ap.add_argument("--epochs", type=int, default=int(config.get("max_epochs", 50)))
-    ap.add_argument("--batch_size", type=int, default=int(config.get("batch_size", 32)))
+    ap.add_argument("--batch_size", "--batch-size", dest="batch_size", type=int, default=int(config.get("batch_size", 32)))
     ap.add_argument("--lr", type=float, default=float(config.get("lr", 1e-4)))
     ap.add_argument("--seed", type=int, default=2023)
-    ap.add_argument("--grad_clip", type=float, default=float(config.get("grad_clip", 0.0)))
-    ap.add_argument("--gen_batch_size", type=int, default=64)
-    ap.add_argument("--clip_gen", action="store_true")
-    ap.add_argument("--rul_cap", type=float, default=125.0, help="Set 0 to disable capping.")
-    ap.add_argument("--use_huber", action="store_true", help="Use SmoothL1Loss (recommended with gen data).")
-    ap.add_argument("--num_workers", type=int, default=0)
-    args = ap.parse_args()
+    ap.add_argument("--grad_clip", "--grad-clip", dest="grad_clip", type=float, default=float(config.get("grad_clip", 0.0)))
+    ap.add_argument("--gen_batch_size", "--gen-batch-size", dest="gen_batch_size", type=int, default=64)
+    ap.add_argument("--clip_gen", "--clip-gen", dest="clip_gen", action="store_true")
+    ap.add_argument("--rul_cap", "--rul-cap", dest="rul_cap", type=float, default=125.0, help="Set 0 to disable capping.")
+    ap.add_argument("--use_huber", "--use-huber", dest="use_huber", action="store_true", help="Use SmoothL1Loss.")
+    ap.add_argument("--num_workers", "--num-workers", dest="num_workers", type=int, default=0)
+    return ap
 
+
+def resolve_fds(args):
+    if args.fds:
+        return normalize_fds(args.fds)
+    if args.fd:
+        return normalize_fds([args.fd])
+    return ["FD001"]
+
+
+def train_rul_for_fd(fd, args):
     set_seed(args.seed)
 
-    out_dir = os.path.join(config["output_dir"], "rul_models_real_plus_gen", args.fd, args.eval_mode)
+    out_dir = os.path.join(config["output_dir"], "rul_models_real_plus_gen", fd, args.eval_mode)
     os.makedirs(out_dir, exist_ok=True)
 
-    # ----- REAL train/test from output/preprocessed -----
-    tr_data, tr_ruls, tr_units, tr_alpha, _ = paths_for_fd(args.fd, "train")
-    te_data, te_ruls, te_units, te_alpha, _ = paths_for_fd(args.fd, "test")
+    tr_data, tr_ruls, tr_units, tr_alpha, _ = paths_for_fd(fd, "train", step=args.step)
+    te_data, te_ruls, te_units, te_alpha, _ = paths_for_fd(fd, "test", step=args.step)
 
-    # ----- FULL GENERATED train set (cached under output/augmented) -----
     gen_data, gen_ruls = build_or_load_generated_train(
-        fd=args.fd,
+        fd=fd,
         batch_size=args.gen_batch_size,
         seed=args.seed,
         clip_gen=args.clip_gen,
+        step=args.step,
     )
 
-    # ----- Test selection mode -----
     if args.eval_mode == "engine":
         units_np = np.load(te_units).astype(np.int32)
         alpha_np = np.load(te_alpha).astype(np.float32)
@@ -366,7 +387,6 @@ def main():
     else:
         idx_keep = None
 
-    # ----- Datasets (memmap) -----
     ds_real_train = MemMapWindowRULDataset(tr_data, tr_ruls, indices=None, rul_cap=args.rul_cap)
     ds_gen_train  = MemMapWindowRULDataset(gen_data, gen_ruls, indices=None, rul_cap=args.rul_cap)
     ds_train = ConcatDataset([ds_real_train, ds_gen_train])
@@ -390,15 +410,14 @@ def main():
         pin_memory=torch.cuda.is_available(),
     )
 
-    print(f"\nFD={args.fd} | eval_mode={args.eval_mode}")
+    print(f"\nFD={fd} | eval_mode={args.eval_mode}")
     print(f"Real train windows: {len(ds_real_train)}")
-    print(f"Gen  train windows: {len(ds_gen_train)}  (FULL, 1-to-1 with real)")
+    print(f"Generated train windows: {len(ds_gen_train)}  (one generated window per real window)")
     print(f"Total train samples (real+gen): {len(ds_train)}")
     print(f"Test samples: {len(ds_test)}")
     print(f"RUL cap: {args.rul_cap}  (0 means disabled)")
     print(f"Model input contract: [B, L, 17]\n")
 
-    # ----- Train models -----
     results = []
     for name, model in build_models():
         print(f"\n--- Training: {name} (real + gen) ---")
@@ -414,7 +433,7 @@ def main():
             use_huber=args.use_huber,
         )
         results.append({
-            "FD": args.fd,
+            "FD": fd,
             "EvalMode": args.eval_mode,
             "Model": name,
             "RMSE": best_rmse,
@@ -429,6 +448,17 @@ def main():
 
     print("\nSaved:", csv_path)
     print(df)
+
+
+def main(argv=None):
+    ap = build_arg_parser()
+    args = ap.parse_args(argv)
+
+    config["output_dir"] = args.output_dir
+    config["window_size"] = args.window_size
+
+    for fd in resolve_fds(args):
+        train_rul_for_fd(fd, args)
 
 
 if __name__ == "__main__":

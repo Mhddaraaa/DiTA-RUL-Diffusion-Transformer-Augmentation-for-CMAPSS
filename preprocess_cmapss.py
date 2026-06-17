@@ -1,13 +1,34 @@
-import numpy as np
-import os
-import torch
-from tqdm.auto import tqdm
-from torch.utils.data import Dataset, DataLoader
-
-
+import argparse
 import os
 import numpy as np
-from tqdm.auto import tqdm
+
+
+VALID_FDS = ("FD001", "FD002", "FD003", "FD004")
+
+
+def normalize_fds(fds):
+    normalized = [fd.upper() for fd in fds]
+    invalid = [fd for fd in normalized if fd not in VALID_FDS]
+    if invalid:
+        raise ValueError(f"Unsupported FD subset(s): {', '.join(invalid)}")
+    return normalized
+
+
+def parse_feature_cols(value):
+    if value is None:
+        return None
+
+    cols = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            cols.extend(range(int(start), int(end) + 1))
+        else:
+            cols.append(int(part))
+    return np.asarray(cols, dtype=np.int64)
 
 
 class CMAPSSPreprocessor:
@@ -43,7 +64,7 @@ class CMAPSSPreprocessor:
         for u in np.unique(unit_ids):
             idx = np.where(unit_ids == u)[0]
             L = len(idx)
-            # cycle positions 0..L-1 => RUL = L-1 - pos
+            # Cycle positions run from 0 to L-1, so RUL is L-1 minus the position.
             rul[idx] = (L - 1) - np.arange(L, dtype=np.float32)
         return rul
 
@@ -56,9 +77,7 @@ class CMAPSSPreprocessor:
         for j, u in enumerate(unique_units):
             idx = np.where(unit_ids == u)[0]
             L = len(idx)
-            # observed tail length => add remaining part
-            # at observed end: rul_end[j]
-            # earlier rows have larger RUL
+            # The observed end has rul_end[j]; earlier rows have larger RUL.
             rul[idx] = rul_end[j] + (L - 1 - np.arange(L, dtype=np.float32))
         return rul
 
@@ -72,7 +91,7 @@ class CMAPSSPreprocessor:
     def _minmax_transform(self, feat, feat_min, denom):
         return (feat - feat_min) / denom
 
-    def _create_windows(self, feat_norm, rul_per_row, unit_ids, window_size, step, fd_tag):
+    def _create_windows(self, feat_norm, rul_per_row, unit_ids, window_size, step):
         windows, ruls, alphas, units = [], [], [], []
 
         for u in np.unique(unit_ids):
@@ -88,9 +107,9 @@ class CMAPSSPreprocessor:
                 ruls.append(rul_per_row[w_idx[-1]])          # RUL at window end
                 units.append(int(u))
 
-                # progress alpha in [0,1] based on window end position within that unit
-                end_pos = start + window_size - 1            # 0-based index of last row in window
-                alpha = end_pos / (T - 1 + 1e-12)            # maps first end_pos to small, last end_pos to ~1
+                # Alpha is the normalized cycle position at the end of the window.
+                end_pos = start + window_size - 1
+                alpha = end_pos / (T - 1 + 1e-12)
                 alpha = float(np.clip(alpha, 0.0, 1.0))
                 alphas.append(alpha)
 
@@ -103,7 +122,7 @@ class CMAPSSPreprocessor:
     def preprocess_fd(self, fd="FD001", window_size=30, step=1, feature_cols=None):
         train_raw, test_raw, rul_end = self._load_raw(fd)
 
-        # Feature selection: columns 1..25 (matches your previous pipeline)
+        # Feature selection: columns 1..25 are used by the model.
         if feature_cols is None:
             feature_cols = np.arange(1, 26)
 
@@ -117,17 +136,17 @@ class CMAPSSPreprocessor:
         train_rul_row = self._compute_train_rul_per_row(train_units)
         test_rul_row  = self._compute_test_rul_per_row(test_units, rul_end)
 
-        # Fit scaler on TRAIN only
+        # Fit the scaler on the training split only.
         feat_min, feat_max, denom = self._minmax_fit(train_feat)
         train_norm = self._minmax_transform(train_feat, feat_min, denom)
         test_norm  = self._minmax_transform(test_feat,  feat_min, denom)
 
         # Create windows
         train_X, train_y, train_a, train_u = self._create_windows(
-            train_norm, train_rul_row, train_units, window_size, step, fd
+            train_norm, train_rul_row, train_units, window_size, step
         )
         test_X, test_y, test_a, test_u = self._create_windows(
-            test_norm, test_rul_row, test_units, window_size, step, fd
+            test_norm, test_rul_row, test_units, window_size, step
         )
 
         # Save
@@ -150,9 +169,40 @@ class CMAPSSPreprocessor:
         print(f"[{fd}] train windows: {train_X.shape}, test windows: {test_X.shape}")
         return (train_X, train_y, train_a, train_u), (test_X, test_y, test_a, test_u)
 
-if __name__ == "__main__":
-    data_dir = "./CMAPSSData"
-    pp = CMAPSSPreprocessor(data_dir=data_dir, out_dir="output/preprocessed")
 
-    for fd in ["FD001", "FD002", "FD003", "FD004"]:
-        pp.preprocess_fd(fd=fd, window_size=30, step=1)
+def build_arg_parser():
+    parser = argparse.ArgumentParser(
+        description="Preprocess CMAPSS FD subsets into normalized sliding-window arrays."
+    )
+    parser.add_argument("--fds", nargs="+", default=list(VALID_FDS), help="FD subsets to preprocess.")
+    parser.add_argument("--data-dir", default="./CMAPSSData", help="Directory containing raw CMAPSS text files.")
+    parser.add_argument("--out-dir", default="output/preprocessed", help="Directory for generated .npy files.")
+    parser.add_argument("--window-size", type=int, default=30, help="Sliding-window length.")
+    parser.add_argument("--step", type=int, default=1, help="Stride between consecutive windows.")
+    parser.add_argument(
+        "--feature-cols",
+        default=None,
+        help="Raw zero-based columns to keep, such as '1-25' or '1,2,5'. Defaults to 1-25.",
+    )
+    return parser
+
+
+def main(argv=None):
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    fds = normalize_fds(args.fds)
+    feature_cols = parse_feature_cols(args.feature_cols)
+
+    pp = CMAPSSPreprocessor(data_dir=args.data_dir, out_dir=args.out_dir)
+    for fd in fds:
+        pp.preprocess_fd(
+            fd=fd,
+            window_size=args.window_size,
+            step=args.step,
+            feature_cols=feature_cols,
+        )
+
+
+if __name__ == "__main__":
+    main()
